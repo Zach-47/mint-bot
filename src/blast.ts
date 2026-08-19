@@ -43,6 +43,9 @@ function hint(msg: string): string | null {
   if (m.includes("replacement transaction underpriced")) return "a tx with this nonce is already pending";
   if (m.includes("intrinsic gas too low")) return "gas limit below intrinsic cost";
   if (m.includes("execution reverted")) return "the contract rejected the mint";
+  if (m.includes("429") || m.includes("too many requests")) {
+    return "rate limited on broadcast - the other endpoint is the fallback";
+  }
   return null;
 }
 

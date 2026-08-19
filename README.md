@@ -107,7 +107,7 @@ node dist/src/index.js sweep --dust   # return leftover native balance
 ### Order of operations before arming
 
 1. `npm run build` — clean, `strict: true`
-2. `npm test` — 33 unit tests
+2. `npm test` — 42 unit tests
 3. `npm run doctor` — must be 0 FAIL with all five wallets funded
 4. `npm run simulate` — must report ~133,000 gas for every wallet
 5. `npm run dry-fire` — dispatch < 1 ms, trigger→dispatch < 5 ms
@@ -154,6 +154,39 @@ Simulated live with the slot-7 override:
 | `mint(2)` | 132,964 | **133,028** |
 
 Both are comfortably under the 180,000 limit. The 64-gas delta does not change anything.
+
+## Rate limiting — the poller paces itself
+
+The RPC enforces a request budget over a rolling window, not a simple per-second
+rate. Measured live: a 50 ms poll ran clean for ~74 s and then began returning
+HTTP 429; once the budget was depleted, even a 100 ms poll throttled; and at a
+different time a 30 ms poll ran 100 s with no throttling at all. The threshold
+moves with source IP and recent history, and a shared Railway egress IP hits it
+sooner than a home connection.
+
+A fixed interval therefore cannot be right — any value is either too slow most of
+the time or gets throttled eventually, and a process that waits days will exhaust
+any budget. So the poller discovers its own pace:
+
+- on HTTP 429, double the interval (capped at `POLL_MAX_INTERVAL_MS`, default 2 s)
+- after 3 s with no throttling, step back down 20% toward `POLL_INTERVAL_MS`
+- never stop polling — a stopped poller misses the flip entirely
+
+Recovery is measured in **time, not in successful polls**. Counting polls would
+couple recovery speed to how slow we already are: at a 2 s backoff, 40 polls is
+80 seconds per step, so climbing back would take many minutes while the bot sits
+far behind the chain.
+
+`POLL_INTERVAL_MS` defaults to 100 ms and is a *target*, not a fixed rate. The
+heartbeat reports the live interval and a throttle count, so you can see what
+pace the bot actually settled at:
+
+```
+HEARTBEAT uptime=300s polls=2841 errors=0 throttled=6 interval=100ms medianRtt=68.4ms minted=1/5000 active=0
+```
+
+Being throttled is logged as a rate-limit warning, not as an RPC failure — the
+"consecutive poll failures" alarm is reserved for the RPC actually being down.
 
 ## Fee policy — do not tune
 

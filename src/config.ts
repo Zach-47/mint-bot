@@ -67,6 +67,7 @@ export interface Config {
   sequencerUrl: string;
   recipient: string;
   pollIntervalMs: number;
+  pollMaxIntervalMs: number;
   quantity: number;
   armed: boolean;
   wallets: WalletCfg[];
@@ -222,7 +223,14 @@ export function loadConfig(): Config {
   const quantity = parseIntEnv("QUANTITY", 2, 1, MAX_PER_WALLET);
 
   /* poll interval */
-  const pollIntervalMs = parseIntEnv("POLL_INTERVAL_MS", 50, 5, 10_000);
+  // 100ms was chosen from live measurement: the RPC enforces a rolling request
+  // budget and a 50ms poll starts returning 429 after ~74s. The poller adapts
+  // from here at runtime, so this is a starting point, not a ceiling.
+  const pollIntervalMs = parseIntEnv("POLL_INTERVAL_MS", 100, 5, 10_000);
+  const pollMaxIntervalMs = parseIntEnv("POLL_MAX_INTERVAL_MS", 2_000, 50, 60_000);
+  if (pollMaxIntervalMs < pollIntervalMs) {
+    die(`POLL_MAX_INTERVAL_MS (${pollMaxIntervalMs}) must be >= POLL_INTERVAL_MS (${pollIntervalMs})`);
+  }
 
   /* armed */
   const armedRaw = (process.env.ARMED ?? "false").trim();
@@ -245,6 +253,7 @@ export function loadConfig(): Config {
     sequencerUrl,
     recipient,
     pollIntervalMs,
+    pollMaxIntervalMs,
     quantity,
     armed: armedRaw === "true",
     wallets,
@@ -260,7 +269,7 @@ export function logConfig(cfg: Config): void {
   log(`rpc=${cfg.rpcUrl}`);
   log(`sequencer=${cfg.sequencerUrl}`);
   log(`recipient=${cfg.recipient}`);
-  log(`quantity=${cfg.quantity} pollIntervalMs=${cfg.pollIntervalMs}`);
+  log(`quantity=${cfg.quantity} pollIntervalMs=${cfg.pollIntervalMs} (max ${cfg.pollMaxIntervalMs}ms)`);
   log(`keys: ${cfg.keySource}`);
   for (const w of cfg.wallets) {
     log(`wallet[${w.index}] ${w.address}${w.path ? `  ${w.path}` : ""}`);

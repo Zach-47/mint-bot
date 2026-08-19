@@ -7,6 +7,63 @@ export interface PollerHandle {
   stop(): void;
 }
 
+/**
+ * Adaptive poll pacing.
+ *
+ * The RPC enforces a request budget over a rolling window, not a simple
+ * per-second rate: measured live, a 50 ms poll ran clean for ~74 s and then
+ * started returning HTTP 429, and once the budget is depleted even 100 ms
+ * throttles. A process that may wait days cannot use a fixed interval - it
+ * will exhaust any budget eventually.
+ *
+ * So the interval is discovered at runtime: back off multiplicatively when
+ * throttled, and creep back toward the target after a clean streak. The loop
+ * never stops polling, because a stopped poller misses the flip entirely.
+ */
+export class RateController {
+  current: number;
+  private lastChange = 0;
+  private readonly target: number;
+  private readonly max: number;
+  private readonly recoverMs: number;
+
+  constructor(targetMs: number, maxMs: number, recoverMs = 3_000) {
+    this.target = targetMs;
+    this.max = maxMs;
+    this.current = targetMs;
+    this.recoverMs = recoverMs;
+  }
+
+  /** HTTP 429. Returns true if the interval changed. */
+  onThrottled(now = Date.now()): boolean {
+    this.lastChange = now;
+    const next = Math.min(this.max, Math.max(this.current * 2, this.target * 2));
+    if (next === this.current) return false;
+    this.current = next;
+    return true;
+  }
+
+  /**
+   * A clean response. Steps back toward the target after `recoverMs` of quiet.
+   *
+   * Recovery is measured in TIME, not in successful polls. Counting polls
+   * couples recovery speed to how slow we already are: at a 2 s backoff, 40
+   * polls is 80 seconds per step, so climbing back would take many minutes -
+   * and a poller stuck at 2 s can be that far behind the flip.
+   */
+  onSuccess(now = Date.now()): boolean {
+    if (this.current <= this.target) return false;
+    if (now - this.lastChange < this.recoverMs) return false;
+    this.lastChange = now;
+    this.current = Math.max(this.target, Math.round(this.current * 0.8));
+    return true;
+  }
+}
+
+export function isThrottle(msg: string): boolean {
+  return msg.includes("429") || msg.toLowerCase().includes("too many requests");
+}
+
 export interface PollerHooks {
   /** Fired exactly once, synchronously, the first time active !== 0. */
   onTrigger(stats: MintStats, t0: number): void;
@@ -82,20 +139,48 @@ export function makeStatsHandler(deps: StatsHandlerDeps): (hex: string) => void 
   };
 }
 
-export function startPoller(cfg: Config, hooks: PollerHooks): PollerHandle {
+/** Transport seam: defaults to the real socket post, replaceable in tests. */
+export type PollTransport = (url: string, body: string) => Promise<string>;
+
+export interface PollerOptions {
+  transport?: PollTransport;
+  /** called after every interval change, for tests and observability */
+  onIntervalChange?: (ms: number) => void;
+}
+
+export function startPoller(
+  cfg: Config,
+  hooks: PollerHooks,
+  opts: PollerOptions = {},
+): PollerHandle {
+  const transport: PollTransport = opts.transport ?? post;
   let stopped = false;
   let polls = 0;
   let errors = 0;
+  let throttles = 0;
   let consecutiveErrors = 0;
   let lastStats: MintStats | null = null;
   const rtt = new Rtt();
   const started = Date.now();
   const throttle = makeThrottledLogger(1000);
+  const rate = new RateController(cfg.pollIntervalMs, cfg.pollMaxIntervalMs);
+  let timer: NodeJS.Timeout | null = null;
 
   const onPollError = (e: Error): void => {
+    const msg = e.message;
+    if (isThrottle(msg)) {
+      throttles++;
+      consecutiveErrors = 0; // being throttled is not the RPC being down
+      if (rate.onThrottled()) {
+        reschedule();
+        opts.onIntervalChange?.(rate.current);
+        warn(`rate limited (429) - backing off to ${rate.current}ms (${throttles} total)`);
+      }
+      return;
+    }
     errors++;
     consecutiveErrors++;
-    throttle("poll", () => warn(`poll error (${errors} total): ${e.message}`));
+    throttle("poll", () => warn(`poll error (${errors} total): ${msg}`));
     if (consecutiveErrors > 20) {
       throttle("poll-fatal", () =>
         error(`${consecutiveErrors} consecutive poll failures - RPC may be down. Still polling.`),
@@ -116,35 +201,46 @@ export function startPoller(cfg: Config, hooks: PollerHooks): PollerHandle {
     const t = performance.now();
     // Fire and forget - do NOT await. Requests overlap in flight so detection
     // latency approaches RTT alone rather than RTT + interval.
-    post(cfg.rpcUrl, STATS_BODY)
+    transport(cfg.rpcUrl, STATS_BODY)
       .then((text) => {
         rtt.push(performance.now() - t);
         consecutiveErrors = 0;
         const o = JSON.parse(text) as { result?: string; error?: { message: string } };
         if (o.error) throw new Error(o.error.message);
         if (typeof o.result !== "string") throw new Error("eth_call returned no result");
+        if (rate.onSuccess()) {
+          reschedule();
+          opts.onIntervalChange?.(rate.current);
+          log(`rate recovered - polling every ${rate.current}ms`);
+        }
         lastStats = decodeStats(o.result);
         onStats(o.result);
       })
       .catch(onPollError);
   };
 
-  const timer = setInterval(tick, cfg.pollIntervalMs);
+  function reschedule(): void {
+    if (stopped) return;
+    if (timer) clearInterval(timer);
+    timer = setInterval(tick, rate.current);
+  }
+
+  reschedule();
   tick();
 
   const heartbeat = setInterval(() => {
     const uptime = Math.floor((Date.now() - started) / 1000);
     const s = lastStats;
     log(
-      `HEARTBEAT uptime=${uptime}s polls=${polls} errors=${errors} ` +
-        `medianRtt=${rtt.median().toFixed(1)}ms ` +
+      `HEARTBEAT uptime=${uptime}s polls=${polls} errors=${errors} throttled=${throttles} ` +
+        `interval=${rate.current}ms medianRtt=${rtt.median().toFixed(1)}ms ` +
         (s ? `minted=${s.minted}/${s.cap} active=${s.active}` : "stats=none"),
     );
   }, HEARTBEAT_MS);
 
   function stop(): void {
     stopped = true;
-    clearInterval(timer);
+    if (timer) clearInterval(timer);
     clearInterval(heartbeat);
   }
 
