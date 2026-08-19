@@ -1,0 +1,27 @@
+{
+  "name": "minipengs-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20 <25"
+  },
+  "scripts": {
+    "build": "tsc",
+    "doctor": "node dist/src/index.js doctor",
+    "simulate": "node dist/src/index.js simulate",
+    "presign": "node dist/src/index.js presign",
+    "watch": "node dist/src/index.js watch",
+    "dry-fire": "node dist/src/index.js dry-fire",
+    "sweep": "node dist/src/index.js sweep",
+    "test": "node --test dist/test/"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.4"
+  }
+}
