@@ -9,7 +9,7 @@ import { error, fail, fmtEth, fmtMs, log, ok, warn } from "./log.js";
 import { closeSockets, startWarmer } from "./rpc.js";
 import { fetchWalletState, noncesChanged, presign, type PreparedTx } from "./presign.js";
 import { startDryFirePoller, startPoller } from "./poller.js";
-import { blast, collect, waitForReceipts, wouldFire } from "./blast.js";
+import { blast, collect, retryFailed, waitForReceipts, wouldFire } from "./blast.js";
 import { Dispatcher } from "./dispatcher.js";
 import { doctor } from "./doctor.js";
 import { simulate } from "./simulate.js";
@@ -134,7 +134,11 @@ async function cmdWatch(cfg: Config): Promise<number> {
 
         void (async () => {
           try {
-            const outcomes = await collect(prepared, results);
+            // Re-send anything that failed for transport or rate-limit
+            // reasons. The poller is stopped by now, so these are the only
+            // requests in flight and the rate budget is refilling.
+            const settled = await retryFailed(await results);
+            const outcomes = await collect(prepared, Promise.resolve(settled));
             const receipts = await waitForReceipts(cfg, prepared, outcomes, t0);
 
             const succeeded = receipts.filter((r) => r.status === 1n);

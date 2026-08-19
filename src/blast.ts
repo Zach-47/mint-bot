@@ -1,7 +1,7 @@
 import type { Config } from "./config.js";
 import { error, fmtMs, log, ok, warn } from "./log.js";
 import type { PreparedTx } from "./presign.js";
-import { call } from "./rpc.js";
+import { call, post } from "./rpc.js";
 import { fire, type Dispatcher, type ShotResult } from "./dispatcher.js";
 
 export interface EndpointOutcome {
@@ -47,6 +47,108 @@ function hint(msg: string): string | null {
     return "rate limited on broadcast - the other endpoint is the fallback";
   }
   return null;
+}
+
+/**
+ * Is this failure worth re-sending for?
+ *
+ * Only transport-level problems and rate limiting. A substantive rejection
+ * (nonce too low, insufficient funds, reverted) will fail identically on a
+ * second attempt and would only burn the window.
+ */
+export function isRetryable(err: string | null): boolean {
+  if (!err) return false;
+  const m = err.toLowerCase();
+  if (m.includes("nonce too low")) return false;
+  if (m.includes("insufficient funds")) return false;
+  if (m.includes("intrinsic gas")) return false;
+  if (m.includes("execution reverted")) return false;
+  if (m.includes("underpriced")) return false;
+  return (
+    m.includes("429") ||
+    m.includes("too many requests") ||
+    m.includes("socket") ||
+    m.includes("timeout") ||
+    m.includes("econnreset") ||
+    m.includes("epipe") ||
+    m.includes("hang up") ||
+    m.includes("no response") ||
+    m.includes("unparseable") ||
+    m.includes("http 5")
+  );
+}
+
+function accepted(s: ShotResult): boolean {
+  if (s.text === null) return false;
+  const p = parseSendResponse(s.text);
+  return p.error === null || isAcceptedError(p.error);
+}
+
+export interface RetryOptions {
+  deadlineMs?: number;
+  maxAttempts?: number;
+  baseDelayMs?: number;
+  /** injectable for tests; defaults to the ordinary https client */
+  send?: (url: string, body: string) => Promise<string>;
+}
+
+/**
+ * Re-send transactions whose broadcast failed for transport or rate-limit
+ * reasons. Re-sending a pre-signed transaction is free and idempotent - same
+ * bytes, same nonce, so at worst the node answers "already known" and only one
+ * can ever land.
+ *
+ * This runs AFTER the synchronous dispatch, so it never touches hot-path
+ * timing. By this point the poller has stopped, so these are the only requests
+ * in flight and the rate-limit budget is refilling rather than draining.
+ *
+ * A wallet stops being retried the moment ANY endpoint accepts it.
+ */
+export async function retryFailed(
+  shots: ShotResult[],
+  opts: RetryOptions = {},
+): Promise<ShotResult[]> {
+  const deadlineMs = opts.deadlineMs ?? 3_000;
+  const maxAttempts = opts.maxAttempts ?? 4;
+  const baseDelayMs = opts.baseDelayMs ?? 100;
+  const send = opts.send ?? post;
+  const deadline = Date.now() + deadlineMs;
+
+  const out = [...shots];
+  const satisfied = new Set<number>();
+  for (const s of out) if (accepted(s)) satisfied.add(s.tx.index);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const todo: number[] = [];
+    for (let i = 0; i < out.length; i++) {
+      const s = out[i]!;
+      if (satisfied.has(s.tx.index)) continue;
+      const err = s.text === null ? s.transportError : parseSendResponse(s.text).error;
+      if (isRetryable(err)) todo.push(i);
+    }
+    if (todo.length === 0) break;
+    if (Date.now() >= deadline) {
+      warn(`retry deadline reached with ${todo.length} broadcast(s) still failing`);
+      break;
+    }
+
+    await new Promise((r) => setTimeout(r, baseDelayMs * attempt));
+
+    log(`retrying ${todo.length} broadcast(s), attempt ${attempt}/${maxAttempts}`);
+    await Promise.all(
+      todo.map(async (i) => {
+        const s = out[i]!;
+        try {
+          const text = await send(s.url, s.tx.body);
+          out[i] = { ...s, text, transportError: null };
+          if (accepted(out[i]!)) satisfied.add(s.tx.index);
+        } catch (e) {
+          out[i] = { ...s, text: null, transportError: (e as Error).message };
+        }
+      }),
+    );
+  }
+  return out;
 }
 
 /** THE HOT PATH. Delegates to the pre-framed socket dispatcher. */

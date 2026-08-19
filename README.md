@@ -107,7 +107,7 @@ node dist/src/index.js sweep --dust   # return leftover native balance
 ### Order of operations before arming
 
 1. `npm run build` — clean, `strict: true`
-2. `npm test` — 42 unit tests
+2. `npm test` — 51 unit tests
 3. `npm run doctor` — must be 0 FAIL with all five wallets funded
 4. `npm run simulate` — must report ~133,000 gas for every wallet
 5. `npm run dry-fire` — dispatch < 1 ms, trigger→dispatch < 5 ms
@@ -187,6 +187,26 @@ HEARTBEAT uptime=300s polls=2841 errors=0 throttled=6 interval=100ms medianRtt=6
 
 Being throttled is logged as a rate-limit warning, not as an RPC failure — the
 "consecutive poll failures" alarm is reserved for the RPC actually being down.
+
+### Broadcast retry
+
+If the flip lands while the poller is backed off, we are being rate limited at
+the exact moment we broadcast. Both endpoints are tried, and the sequencer is a
+separate host with its own budget — but without a retry, a simultaneous 429 on
+both would lose the mint outright.
+
+So failed broadcasts are re-sent: up to 4 attempts over a 3 s deadline, and a
+wallet stops being retried the moment *any* endpoint accepts it. Re-sending a
+pre-signed transaction is free and idempotent — same bytes, same nonce, so only
+one can ever land and the rest answer `already known`.
+
+Only transport failures and rate limiting are retried. A substantive rejection
+(`nonce too low`, `insufficient funds`, `execution reverted`) fails identically
+on a second attempt, so retrying it would only burn the window.
+
+This runs *after* the synchronous dispatch, so hot-path timing is untouched. By
+then the poller has stopped, which means these are the only requests in flight
+and the rate budget is refilling rather than draining.
 
 ## Fee policy — do not tune
 
