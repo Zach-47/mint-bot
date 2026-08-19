@@ -1,5 +1,5 @@
 import { config as loadEnv } from "dotenv";
-import { Wallet, getAddress, isAddress } from "ethers";
+import { BaseWallet, HDNodeWallet, Mnemonic, Wallet, getAddress, isAddress } from "ethers";
 import { fail, log } from "./log.js";
 
 loadEnv();
@@ -52,10 +52,17 @@ export const HEARTBEAT_MS = 30_000;
 export interface WalletCfg {
   index: number;
   address: string;
-  wallet: Wallet;
+  wallet: BaseWallet;
+  /** derivation path when the wallet came from a mnemonic */
+  path?: string;
 }
 
+/** Default BIP-44 account path - the same one MetaMask, Rabby and Ledger use. */
+export const DEFAULT_DERIVATION_BASE = "m/44'/60'/0'/0";
+
 export interface Config {
+  /** where the keys came from, for logging - never contains key material */
+  keySource: string;
   rpcUrl: string;
   sequencerUrl: string;
   recipient: string;
@@ -86,18 +93,96 @@ function parseIntEnv(name: string, def: number, min: number, max: number): numbe
   return n;
 }
 
-let cached: Config | null = null;
+/**
+ * Derive `count` wallets from a BIP-39 mnemonic, starting at `start`.
+ *
+ * Uses the standard BIP-44 path m/44'/60'/0'/0/i, so index i is the same
+ * address your wallet app shows as account i+1. Verified against the
+ * published test vectors for the standard test mnemonic.
+ *
+ * Pure and exported so it can be tested without touching the environment.
+ */
+export function deriveWallets(
+  phrase: string,
+  passphrase: string,
+  base: string,
+  count: number,
+  start: number,
+): Array<{ index: number; address: string; wallet: HDNodeWallet; path: string }> {
+  // Throws on a bad word or a bad checksum - a typo must never silently
+  // derive a different, unfunded set of wallets.
+  Mnemonic.fromPhrase(phrase, passphrase);
 
-export function loadConfig(): Config {
-  if (cached) return cached;
+  const out: Array<{ index: number; address: string; wallet: HDNodeWallet; path: string }> = [];
+  for (let n = 0; n < count; n++) {
+    const i = start + n;
+    const path = `${base}/${i}`;
+    const w = HDNodeWallet.fromPhrase(phrase, passphrase, path);
+    out.push({ index: n, address: getAddress(w.address), wallet: w, path });
+  }
+  return out;
+}
 
-  /* private keys */
+/** Normalise a mnemonic: trim, collapse whitespace, lowercase. */
+export function normaliseMnemonic(raw: string): string {
+  return raw.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function loadWallets(): { wallets: WalletCfg[]; keySource: string } {
+  const rawMnemonic = process.env.MNEMONIC ?? "";
+  const hasMnemonic = rawMnemonic.trim() !== "" && !rawMnemonic.startsWith("word1 word2");
+  const pkIndices: number[] = [];
+  for (let i = 0; i < 32; i++) {
+    const v = process.env[`PK_${i}`];
+    if (v !== undefined && v.trim() !== "" && v.trim() !== "0x...") pkIndices.push(i);
+  }
+
+  if (hasMnemonic && pkIndices.length > 0) {
+    die(
+      `both MNEMONIC and PK_${pkIndices[0]} are set - that is ambiguous. ` +
+        `Use one or the other, not both.`,
+    );
+  }
+
+  if (hasMnemonic) {
+    const phrase = normaliseMnemonic(rawMnemonic);
+    const words = phrase.split(" ").length;
+    if (![12, 15, 18, 21, 24].includes(words)) {
+      die(`MNEMONIC has ${words} words - expected 12, 15, 18, 21 or 24`);
+    }
+    const count = parseIntEnv("WALLET_COUNT", 5, 1, 20);
+    const start = parseIntEnv("WALLET_START_INDEX", 0, 0, 1_000_000);
+    const base = (process.env.DERIVATION_PATH ?? DEFAULT_DERIVATION_BASE).trim();
+    if (!/^m(\/\d+'?)+$/.test(base)) {
+      die(`DERIVATION_PATH "${base}" is not a valid BIP-32 path prefix (e.g. m/44'/60'/0'/0)`);
+    }
+    const passphrase = process.env.MNEMONIC_PASSPHRASE ?? "";
+
+    let derived: ReturnType<typeof deriveWallets>;
+    try {
+      derived = deriveWallets(phrase, passphrase, base, count, start);
+    } catch (e) {
+      // Never echo the phrase itself into the message.
+      die(`MNEMONIC is not a valid BIP-39 phrase: ${(e as Error).message}`);
+    }
+    const wallets: WalletCfg[] = derived.map((d) => ({
+      index: d.index,
+      address: d.address,
+      wallet: d.wallet,
+      path: d.path,
+    }));
+    const last = start + count - 1;
+    return {
+      wallets,
+      keySource: `mnemonic (${words} words${passphrase ? " + passphrase" : ""}), ${base}/${start}..${last}`,
+    };
+  }
+
+  /* individual private keys */
   const wallets: WalletCfg[] = [];
   const seen = new Map<string, number>();
-  for (let i = 0; i < 32; i++) {
-    const raw = process.env[`PK_${i}`];
-    if (raw === undefined || raw.trim() === "" || raw.trim() === "0x...") continue;
-    const key = raw.trim();
+  for (const i of pkIndices) {
+    const key = (process.env[`PK_${i}`] ?? "").trim();
     if (!/^0x[0-9a-fA-F]{64}$/.test(key)) {
       die(`PK_${i} is not a 0x-prefixed 32-byte hex private key`);
     }
@@ -115,7 +200,18 @@ export function loadConfig(): Config {
     seen.set(addr.toLowerCase(), i);
     wallets.push({ index: i, address: addr, wallet: w });
   }
-  if (wallets.length === 0) die("no private keys found - set PK_0 .. PK_4");
+  if (wallets.length === 0) {
+    die("no wallets configured - set MNEMONIC, or PK_0 .. PK_4");
+  }
+  return { wallets, keySource: `private keys PK_${pkIndices.join(", PK_")}` };
+}
+
+let cached: Config | null = null;
+
+export function loadConfig(): Config {
+  if (cached) return cached;
+
+  const { wallets, keySource } = loadWallets();
 
   /* recipient */
   const recipientRaw = (process.env.RECIPIENT ?? DEFAULT_RECIPIENT).trim();
@@ -144,6 +240,7 @@ export function loadConfig(): Config {
   const minBalance = mintValue + GAS_MINT * MAX_FEE;
 
   cached = {
+    keySource,
     rpcUrl,
     sequencerUrl,
     recipient,
@@ -164,6 +261,9 @@ export function logConfig(cfg: Config): void {
   log(`sequencer=${cfg.sequencerUrl}`);
   log(`recipient=${cfg.recipient}`);
   log(`quantity=${cfg.quantity} pollIntervalMs=${cfg.pollIntervalMs}`);
-  for (const w of cfg.wallets) log(`wallet[${w.index}] ${w.address}`);
+  log(`keys: ${cfg.keySource}`);
+  for (const w of cfg.wallets) {
+    log(`wallet[${w.index}] ${w.address}${w.path ? `  ${w.path}` : ""}`);
+  }
   log(`ARMED=${cfg.armed}`);
 }

@@ -38,11 +38,56 @@ transaction.
 npm ci && npm run build
 ```
 
-Copy `.env.example` to `.env` and fill in `PK_0` … `PK_4`. Keys are generated **offline by
-the operator** — this bot never generates keys and never logs them.
+### Wallets
 
-Fund each wallet with **0.0030 ETH** (0.0150 total). The hard minimum is 0.00256 ETH
-(`0.0022` value + `180000 × 2 gwei` reservation); below 0.0030 the sweep gas gets tight.
+Use **either** a mnemonic **or** individual private keys. Setting both is refused
+as ambiguous rather than silently picking one.
+
+**Option A - one seed phrase (recommended).** Set `MNEMONIC` to your 12- or
+24-word phrase and `WALLET_COUNT` to how many wallets to derive:
+
+```bash
+MNEMONIC="word1 word2 ... word12"
+WALLET_COUNT=5
+```
+
+Derivation is the standard BIP-44 path `m/44'/60'/0'/0/i`, the same one MetaMask,
+Rabby and Ledger use — so wallet `i` is exactly the address your wallet app shows
+as account `i+1`. That means you can fund them directly from your wallet UI and
+see the NFTs land there. Verified in the test suite against the published
+addresses for the standard test mnemonic.
+
+Extras, all optional:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WALLET_COUNT` | 5 | how many accounts to derive |
+| `WALLET_START_INDEX` | 0 | start at a later account if account 0 is in use |
+| `MNEMONIC_PASSPHRASE` | *(none)* | BIP-39 25th word — only set if you use one |
+| `DERIVATION_PATH` | `m/44'/60'/0'/0` | only for non-standard wallet apps |
+
+`MNEMONIC_PASSPHRASE` is the sharp edge: setting it when your wallet does not use
+one derives a completely different, unfunded set of addresses. `doctor` prints
+every derived address and its path — check them against your wallet app before
+funding anything.
+
+**Option B - explicit private keys.** Set `PK_0` … `PK_4` to 32-byte hex keys
+generated offline. Duplicates are detected and rejected, since a duplicated paste
+would mean one wallet mints twice and the second reverts.
+
+Either way, the phrase and the keys are only ever read, never logged. Startup
+prints the source as e.g. `mnemonic (12 words), m/44'/60'/0'/0/0..4` — word count
+and path, never key material.
+
+In a local `.env` the phrase needs quotes because it contains spaces
+(`MNEMONIC="word1 word2 ..."`). In the Railway dashboard, paste it raw with no
+quotes.
+
+### Funding
+
+Fund each wallet with **0.0030 ETH** (0.0150 total for five). The hard minimum is
+0.00256 ETH (`0.0022` value + `180000 × 2 gwei` reservation); below 0.0030 the
+sweep gas gets tight.
 
 ## Commands
 
@@ -62,7 +107,7 @@ node dist/src/index.js sweep --dust   # return leftover native balance
 ### Order of operations before arming
 
 1. `npm run build` — clean, `strict: true`
-2. `npm test` — 26 unit tests
+2. `npm test` — 33 unit tests
 3. `npm run doctor` — must be 0 FAIL with all five wallets funded
 4. `npm run simulate` — must report ~133,000 gas for every wallet
 5. `npm run dry-fire` — dispatch < 1 ms, trigger→dispatch < 5 ms
@@ -156,6 +201,12 @@ These are documented deliberately rather than coded around.
   polls and fires clean, but nothing guarantees you land first.
 - **Consolidating to one recipient makes the five-wallet cluster trivially linkable
   on-chain.** Accepted trade-off, recorded here on purpose.
+- **Deriving all five wallets from one seed concentrates the blast radius.** The
+  phrase sits in a third-party dashboard and controls every derived account —
+  including any account you use for something else, at any index, forever. Use a
+  seed created solely for this mint, not your main wallet's. With separate `PK_*`
+  keys a single leak costs you one wallet; with a shared seed it costs you all of
+  them and every future account under it.
 - **Five wallets to get around `MAX_PER_WALLET = 2` is deliberate circumvention** of the
   contract's per-wallet fairness cap. It is not an exploit — it calls a public function
   exactly as written — but projects do blacklist sybil clusters and revoke holder benefits.
@@ -166,7 +217,7 @@ These are documented deliberately rather than coded around.
 ```
 src/
   index.ts       subcommand dispatch, watch flow
-  config.ts      env parsing + validation, all verified constants
+  config.ts      env parsing + validation, mnemonic/key derivation, constants
   rpc.ts         keep-alive JSON-RPC client + socket warmer
   fastlane.ts    raw TLS sockets with pre-framed HTTP requests
   dispatcher.ts  binds pre-signed txs to sockets; the fire() call
