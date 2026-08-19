@@ -14,7 +14,7 @@
     "watch": "node dist/src/index.js watch",
     "dry-fire": "node dist/src/index.js dry-fire",
     "sweep": "node dist/src/index.js sweep",
-    "test": "node --test dist/test/"
+    "test": "node --test dist/test/*.test.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
